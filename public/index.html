@@ -5,66 +5,46 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>PO Tracking</title>
   <style>
-    body { font-family: Arial, sans-serif; margin: 16px; }
-    .row { display:flex; gap:10px; flex-wrap:wrap; margin-bottom: 12px; align-items:center; }
-    input, select, button { padding: 8px; }
+    body { font-family: system-ui, Arial, sans-serif; margin: 16px; }
+    input, button, select { padding: 8px; font-size: 14px; }
     button { cursor:pointer; }
-    .card { border:1px solid #ddd; border-radius:8px; padding:12px; margin-top: 12px; }
-    .muted { color:#666; font-size: 12px; }
 
-    table { border-collapse: collapse; width: 100%; }
-    th, td { border: 1px solid #ddd; padding: 8px; }
-    th { background: #f5f5f5; text-align:left; }
-    tr:hover { background: #fafafa; }
+    .top { display:flex; gap:10px; align-items:center; }
+    #q { flex:1; }
 
-    details summary { list-style: none; cursor: pointer; user-select:none; }
+    details summary { list-style:none; cursor:pointer; user-select:none; padding:10px; border:1px solid #ddd; border-radius:10px; background:#fafafa; }
     details summary::-webkit-details-marker { display:none; }
-    details summary::before { content:"📁 "; }
-    details[open] summary::before { content:"📂 "; }
+    details.month > summary::before { content:"📁 "; }
+    details.month[open] > summary::before { content:"📂 "; }
+    details.po > summary::before { content:"🗂️ "; }
+    details.po[open] > summary::before { content:"🗃️ "; }
 
-    summary { padding:10px; border:1px solid #ddd; border-radius:8px; background:#f7f7f7; }
-    details[open] summary { border-bottom-left-radius:0; border-bottom-right-radius:0; }
+    .box { border:1px solid #ddd; border-radius:10px; padding:10px; margin-top:10px; }
+    .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
 
-    .month-body { border:1px solid #ddd; border-top:none; border-bottom-left-radius:8px; border-bottom-right-radius:8px; padding:10px; }
-    .pill { display:inline-block; padding:2px 8px; border:1px solid #ddd; border-radius:999px; font-size:12px; color:#444; margin-left:8px; }
-    .danger { border-color:#f0b; }
+    .steps { margin-top:10px; display:flex; flex-direction:column; gap:10px; }
+    .step { border:1px solid #e5e5e5; border-radius:10px; padding:10px; background:#fff; }
+    .step-head { display:flex; align-items:center; justify-content:space-between; gap:10px; }
+    .step-title { font-weight:600; }
+    .muted { color:#666; font-size: 13px; margin-top:6px; }
+    .links { display:flex; gap:8px; flex-wrap:wrap; margin-top:8px; }
+    .links input { flex:1; min-width: 220px; }
+    .fileline { margin-top:8px; display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+    a { color: #0b57d0; text-decoration:none; }
+    a:hover { text-decoration:underline; }
+
+    .pill { border:1px solid #ddd; border-radius:999px; padding:2px 8px; font-size:12px; color:#444; }
+    .done { border-color:#9ad; }
   </style>
 </head>
 <body>
-  <h2>PO Tracking</h2>
 
-  <!-- Search + filters -->
-  <div class="row">
-    <input id="q" placeholder="Search IT Ref / Title / Vendor / Form Name" size="40" />
-    <select id="stage"><option value="">All stages</option></select>
-    <select id="capex">
-      <option value="">CAPEX/OPEX</option>
-      <option value="CAPEX">CAPEX</option>
-      <option value="OPEX">OPEX</option>
-    </select>
-    <select id="vendor"><option value="">All vendors</option></select>
-    <button id="refresh">Refresh</button>
+  <div class="top">
+    <input id="q" placeholder="Search" />
+    <button id="newMonthBtn">+ Month</button>
   </div>
 
-  <!-- Create -->
-  <div class="row card">
-    <b>Create New</b>
-    <input id="it_ref_no" placeholder="IT Ref No (manual)" />
-    <input id="title" placeholder="Title" size="30" />
-    <select id="capex_new">
-      <option value="CAPEX">CAPEX</option>
-      <option value="OPEX">OPEX</option>
-    </select>
-    <button id="create">Create</button>
-    <span class="muted">New items start at <b>QUOTATION_COLLECTING</b></span>
-  </div>
-
-  <!-- Month toggles -->
-  <h3 style="margin-top:16px;">Requests (Grouped by Month)</h3>
-  <div id="monthGroups"></div>
-
-  <!-- Detail -->
-  <div id="detail" class="card"></div>
+  <div id="tree" style="margin-top:12px;"></div>
 
   <script src="app.js"></script>
 </body>
