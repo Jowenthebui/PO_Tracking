@@ -1,45 +1,48 @@
 const express = require("express");
 const path = require("path");
 const fs = require("fs");
+const session = require("express-session");
+const bcrypt = require("bcryptjs");
 const multer = require("multer");
 const db = require("./db");
 
 const app = express();
 app.use(express.json());
 
+app.use(
+  session({
+    secret: process.env.SESSION_SECRET || "dev_secret_change_me",
+    resave: false,
+    saveUninitialized: false,
+    cookie: { httpOnly: true }
+  })
+);
+
 // Serve UI
 app.use(express.static(path.join(__dirname, "public")));
 
-// Serve uploaded files
-app.use("/uploads", express.static(path.join(__dirname, "uploads")));
+// ✅ Serve uploaded files
+const UPLOAD_DIR = path.join(__dirname, "uploads");
+fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+app.use("/uploads", express.static(UPLOAD_DIR));
 
 const nowISO = () => new Date().toISOString();
-
-// Ensure uploads folder exists
-const uploadDir = path.join(__dirname, "uploads");
-if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir);
-
-// Safe filename storage
-const storage = multer.diskStorage({
-  destination: (_, __, cb) => cb(null, uploadDir),
-  filename: (_, file, cb) => {
-    const safe = file.originalname.replace(/[^\w.\- ]+/g, "_");
-    cb(null, `${Date.now()}_${safe}`);
-  }
-});
-const upload = multer({ storage });
 
 // Steps 1–9
 const DEFAULT_STEPS = [
   { no: 1, title: "Quotations", desc: "Please upload quotations." },
   { no: 2, title: "Create Capex/Opex Form in Excel", desc: "Fill in the CAPEX/OPEX form and upload the file." },
   { no: 3, title: "Combine Capex/Opex Form with Quotations", desc: "Combine CAPEX/OPEX form with the quotations. If multiple vendor, put the chosen one first." },
-  { no: 4, title: "Signed Combined File", desc: "Please upload the signed CAPEX/OPEX form here and tick the checkbox after signed." },
-  { no: 5, title: "Update Signed Capex/Opex Form to Admin", desc: "Update to SharePoint and upload to Masterlist. Tick checkbox after done." },
-  { no: 6, title: "PO", desc: "Get PO from Admin, send it back to manager on Outlook. Upload PO here and tick checkbox after sending." },
+  { no: 4, title: "Signed Combined File", desc: "Please upload the signed CAPEX/OPEX form here." },
+  {
+    no: 5,
+    title: "Update Signed Capex/Opex Form to Admin",
+    desc: "Update Signed Capex/Opex Form to Master List, upload the files to SharePoint."
+  },
+  { no: 6, title: "PO", desc: "Get PO from Admin and send it back to manager on Outlook." },
   { no: 7, title: "Invoice", desc: "Get invoice from vendor and upload here." },
-  { no: 8, title: "Update Invoice to Admin", desc: "Upload invoice on Masterlist and SharePoint folder. Tick checkbox after done." },
-  { no: 9, title: "Admin Make Payment", desc: "Tick checkbox when payment is made. Optional: upload proof of payment." }
+  { no: 8, title: "Update Invoice to Admin", desc: "Upload invoice on Master List and SharePoint folder, and update Notion status." },
+  { no: 9, title: "Admin Make Payment", desc: "Tick checkbox when payment is made." }
 ];
 
 function parsePOFolderName(folder_name) {
@@ -58,51 +61,251 @@ function parsePOFolderName(folder_name) {
 
   let title = "Untitled";
   const capIndex = parts.findIndex(p => ["capex", "opex"].includes(p.toLowerCase()));
-  if (capIndex >= 0 && parts[capIndex + 1]) {
-    title = parts.slice(capIndex + 1).join(" ");
-  } else if (parts.length) {
-    title = parts.slice(1).join(" ") || raw;
-  }
+  if (capIndex >= 0 && parts[capIndex + 1]) title = parts.slice(capIndex + 1).join(" ");
+  else if (parts.length) title = parts.slice(1).join(" ") || raw;
 
   return { capex_opex, it_ref_no, title };
 }
 
-function stepHasAnyFiles(stepId) {
-  const row = db
-    .prepare(`SELECT 1 AS ok FROM po_step_files WHERE step_id = ? LIMIT 1`)
-    .get(stepId);
-  return !!row;
-}
+// ✅ server-side done rules that match the UI
+function computeStepDone(step_no, stepRow, fileCount) {
+  // Steps that are done when they have at least 1 uploaded file
+  if ([1, 2, 3, 4, 7].includes(step_no)) return (fileCount || 0) > 0;
 
-// Completion rules (now based on: any files exist)
-function computeStepDone(step_no, hasFiles, action_done) {
-  // Auto done when file exists
-  if ([1, 2, 3, 7].includes(step_no)) return hasFiles;
+  // Step 5 & 8: 3 checkboxes
+  if (step_no === 5 || step_no === 8) {
+    return !!stepRow.masterlist_done && !!stepRow.sharepoint_done && !!stepRow.notion_done;
+  }
 
-  // Need file + checkbox
-  if ([4, 6].includes(step_no)) return hasFiles && !!action_done;
+  // Step 6: outlook checkbox only
+  if (step_no === 6) return !!stepRow.outlook_done;
 
-  // Checkbox only (file optional for 9)
-  if ([5, 8, 9].includes(step_no)) return !!action_done;
+  // Step 9: payment checkbox only
+  if (step_no === 9) return !!stepRow.paid_done;
 
   return false;
 }
 
-// ---- API ----
+function getStepFileCount(stepId) {
+  const r = db.prepare(`SELECT COUNT(*) AS c FROM po_step_files WHERE step_id = ?`).get(stepId);
+  return Number(r?.c || 0);
+}
 
-// Create month folder
-app.post("/api/months", (req, res) => {
+function recomputeAndSaveStep(stepId, username) {
+  const step = db.prepare(`SELECT * FROM po_steps WHERE id = ?`).get(stepId);
+  if (!step) return;
+
+  const fileCount = getStepFileCount(stepId);
+  const is_done = computeStepDone(step.step_no, step, fileCount) ? 1 : 0;
+
+  db.prepare(`
+    UPDATE po_steps
+    SET is_done = ?,
+        manual_done = ?,
+        updated_at = ?,
+        updated_by = ?
+    WHERE id = ?
+  `).run(is_done, step.manual_done || 0, nowISO(), username, stepId);
+
+  db.prepare(`UPDATE po_folders SET updated_at = ?, updated_by = ? WHERE id = ?`)
+    .run(nowISO(), username, step.po_id);
+}
+
+// -------- AUTH --------
+function requireAuth(req, res, next) {
+  if (!req.session.user) return res.status(401).json({ error: "Not logged in" });
+  next();
+}
+function requireAdmin(req, res, next) {
+  if (!req.session.user?.is_admin) return res.status(403).json({ error: "Admin only" });
+  next();
+}
+
+// Create default admin if missing
+function ensureAdminUser() {
+  const adminUsername = "infra.support";
+  const adminPw = "P@ssw0rd123";
+
+  const existing = db.prepare(`SELECT * FROM users WHERE username = ?`).get(adminUsername);
+  if (existing) return;
+
+  const hash = bcrypt.hashSync(adminPw, 10);
+  const t = nowISO();
+  db.prepare(`
+    INSERT INTO users (username, password_hash, is_admin, created_at, updated_at)
+    VALUES (?, ?, 1, ?, ?)
+  `).run(adminUsername, hash, t, t);
+
+  console.log("Created default admin user:", adminUsername);
+}
+ensureAdminUser();
+
+app.post("/api/login", (req, res) => {
+  const { username, password } = req.body || {};
+  if (!username || !password) return res.status(400).json({ error: "username and password required" });
+
+  const user = db.prepare(`SELECT id, username, password_hash, is_admin FROM users WHERE username = ?`).get(username);
+  if (!user) return res.status(401).json({ error: "Invalid username or password" });
+
+  const ok = bcrypt.compareSync(password, user.password_hash);
+  if (!ok) return res.status(401).json({ error: "Invalid username or password" });
+
+  req.session.user = { id: user.id, username: user.username, is_admin: !!user.is_admin };
+  res.json({ ok: true, user: req.session.user });
+});
+
+app.post("/api/logout", (req, res) => {
+  req.session.destroy(() => res.json({ ok: true }));
+});
+
+app.get("/api/me", (req, res) => {
+  res.json({ user: req.session.user || null });
+});
+
+// -------- ADMIN USERS --------
+app.get("/api/admin/users", requireAuth, requireAdmin, (_req, res) => {
+  const users = db.prepare(`
+    SELECT id, username, is_admin, created_at, updated_at
+    FROM users
+    ORDER BY is_admin DESC, username ASC
+  `).all();
+  res.json({ users });
+});
+
+app.post("/api/admin/users", requireAuth, requireAdmin, (req, res) => {
+  const { username, password, is_admin } = req.body || {};
+  if (!username || !password) return res.status(400).json({ error: "username and password required" });
+
+  const hash = bcrypt.hashSync(password, 10);
+  const t = nowISO();
+
+  try {
+    const info = db.prepare(`
+      INSERT INTO users (username, password_hash, is_admin, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?)
+    `).run(username.trim(), hash, is_admin ? 1 : 0, t, t);
+
+    res.json({ ok: true, id: info.lastInsertRowid });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+app.patch("/api/admin/users/:id", requireAuth, requireAdmin, (req, res) => {
+  const id = Number(req.params.id);
+  const user = db.prepare(`SELECT * FROM users WHERE id = ?`).get(id);
+  if (!user) return res.status(404).json({ error: "User not found" });
+
+  const { username, password, is_admin } = req.body || {};
+  const nextUsername = typeof username === "string" && username.trim() ? username.trim() : user.username;
+  const nextAdmin = typeof is_admin === "boolean" ? (is_admin ? 1 : 0) : user.is_admin;
+
+  let nextHash = user.password_hash;
+  if (typeof password === "string" && password.length > 0) {
+    nextHash = bcrypt.hashSync(password, 10);
+  }
+
+  try {
+    db.prepare(`
+      UPDATE users
+      SET username = ?, password_hash = ?, is_admin = ?, updated_at = ?
+      WHERE id = ?
+    `).run(nextUsername, nextHash, nextAdmin, nowISO(), id);
+
+    if (req.session.user?.id === id) {
+      req.session.user.username = nextUsername;
+      req.session.user.is_admin = !!nextAdmin;
+    }
+
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+// -------- UPLOADS --------
+const storage = multer.diskStorage({
+  destination: (_req, _file, cb) => cb(null, UPLOAD_DIR),
+  filename: (_req, file, cb) => {
+    const safeOrig = String(file.originalname || "file")
+      .replace(/[^\w.\-() ]+/g, "_")
+      .slice(0, 120);
+    const unique = `${Date.now()}-${Math.random().toString(16).slice(2)}-${safeOrig}`;
+    cb(null, unique);
+  }
+});
+const upload = multer({ storage });
+
+// Upload file to a step
+app.post("/api/step/:id/upload", requireAuth, upload.single("file"), (req, res) => {
+  const stepId = Number(req.params.id);
+  const step = db.prepare(`SELECT * FROM po_steps WHERE id = ?`).get(stepId);
+  if (!step) return res.status(404).json({ error: "Step not found" });
+
+  if (!req.file) return res.status(400).json({ error: "No file uploaded" });
+
+  const user = req.session.user.username;
+  const t = nowISO();
+
+  const file_name = req.file.originalname || req.file.filename;
+  const file_path = `/uploads/${req.file.filename}`;
+
+  db.prepare(`
+    INSERT INTO po_step_files (step_id, file_name, file_path, uploaded_at, uploaded_by)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(stepId, file_name, file_path, t, user);
+
+  // recompute done
+  recomputeAndSaveStep(stepId, user);
+
+  res.json({ ok: true });
+});
+
+// Delete uploaded file
+app.delete("/api/file/:id", requireAuth, (req, res) => {
+  const fileId = Number(req.params.id);
+  const f = db.prepare(`SELECT * FROM po_step_files WHERE id = ?`).get(fileId);
+  if (!f) return res.status(404).json({ error: "File not found" });
+
+  const step = db.prepare(`SELECT * FROM po_steps WHERE id = ?`).get(f.step_id);
+  if (!step) return res.status(404).json({ error: "Step not found" });
+
+  // remove DB row first
+  db.prepare(`DELETE FROM po_step_files WHERE id = ?`).run(fileId);
+
+  // remove physical file if it exists
+  try {
+    const diskName = String(f.file_path || "").replace(/^\/uploads\//, "");
+    const full = path.join(UPLOAD_DIR, diskName);
+    if (full.startsWith(UPLOAD_DIR) && fs.existsSync(full)) fs.unlinkSync(full);
+  } catch (_) {
+    // ignore
+  }
+
+  const user = req.session.user.username;
+  recomputeAndSaveStep(step.id, user);
+
+  res.json({ ok: true });
+});
+
+// -------- APP API --------
+
+// Create month
+app.post("/api/months", requireAuth, (req, res) => {
   const { month_key, label } = req.body;
 
   if (!month_key || !/^\d{4}-\d{2}$/.test(month_key)) {
     return res.status(400).json({ error: "month_key must be YYYY-MM (e.g. 2026-02)" });
   }
 
+  const t = nowISO();
+  const u = req.session.user.username;
+
   try {
     const info = db.prepare(`
-      INSERT INTO months (month_key, label, created_at)
-      VALUES (?, ?, ?)
-    `).run(month_key, label || month_key, nowISO());
+      INSERT INTO months (month_key, label, created_at, created_by, updated_at, updated_by)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(month_key, label || month_key, t, u, t, u);
 
     res.json({ id: info.lastInsertRowid });
   } catch (e) {
@@ -110,8 +313,34 @@ app.post("/api/months", (req, res) => {
   }
 });
 
-// Tree with done summary
-app.get("/api/tree", (_req, res) => {
+// Edit month label
+app.patch("/api/months/:id", requireAuth, (req, res) => {
+  const id = Number(req.params.id);
+  const m = db.prepare(`SELECT * FROM months WHERE id = ?`).get(id);
+  if (!m) return res.status(404).json({ error: "Month not found" });
+
+  const { label } = req.body || {};
+  if (!label || !String(label).trim()) return res.status(400).json({ error: "label required" });
+
+  const u = req.session.user.username;
+  db.prepare(`
+    UPDATE months
+    SET label = ?, updated_at = ?, updated_by = ?
+    WHERE id = ?
+  `).run(String(label).trim(), nowISO(), u, id);
+
+  res.json({ ok: true });
+});
+
+// Delete month (cascades POs)
+app.delete("/api/months/:id", requireAuth, (req, res) => {
+  const id = Number(req.params.id);
+  db.prepare(`DELETE FROM months WHERE id = ?`).run(id);
+  res.json({ ok: true });
+});
+
+// Tree
+app.get("/api/tree", requireAuth, (_req, res) => {
   const months = db.prepare(`SELECT * FROM months ORDER BY month_key DESC`).all();
 
   const pos = db.prepare(`
@@ -142,68 +371,105 @@ app.get("/api/tree", (_req, res) => {
   res.json([...map.values()]);
 });
 
-// Create PO (only month_id + folder_name)
-app.post("/api/po", (req, res) => {
+// Create PO
+app.post("/api/po", requireAuth, (req, res) => {
   const { month_id, folder_name } = req.body;
-
-  if (!month_id || !folder_name) {
-    return res.status(400).json({ error: "month_id and folder_name required" });
-  }
+  if (!month_id || !folder_name) return res.status(400).json({ error: "month_id and folder_name required" });
 
   const { capex_opex, it_ref_no, title } = parsePOFolderName(folder_name);
-
-  const created_at = nowISO();
-  const updated_at = created_at;
+  const t = nowISO();
+  const u = req.session.user.username;
 
   const trx = db.transaction(() => {
     const info = db.prepare(`
-      INSERT INTO po_folders (month_id, folder_name, capex_opex, it_ref_no, title, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run(month_id, folder_name, capex_opex, it_ref_no, title, created_at, updated_at);
+      INSERT INTO po_folders (month_id, folder_name, capex_opex, it_ref_no, title, created_at, created_by, updated_at, updated_by)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(month_id, folder_name, capex_opex, it_ref_no, title, t, u, t, u);
 
     const poId = info.lastInsertRowid;
 
     const ins = db.prepare(`
-      INSERT INTO po_steps (po_id, step_no, step_title, step_desc, is_done, action_done, created_at, updated_at)
-      VALUES (?, ?, ?, ?, 0, 0, ?, ?)
+      INSERT INTO po_steps (
+        po_id, step_no, step_title, step_desc,
+        is_done, manual_done,
+        masterlist_done, sharepoint_done, notion_done, outlook_done, paid_done,
+        created_at, created_by, updated_at, updated_by
+      )
+      VALUES (?, ?, ?, ?, 0, 0, 0, 0, 0, 0, 0, ?, ?, ?, ?)
     `);
 
     for (const s of DEFAULT_STEPS) {
-      const t = nowISO();
-      ins.run(poId, s.no, s.title, s.desc, t, t);
+      const tt = nowISO();
+      ins.run(poId, s.no, s.title, s.desc, tt, u, tt, u);
     }
 
     return poId;
   });
 
   try {
-    const poId = trx();
-    res.json({ id: poId });
+    res.json({ id: trx() });
   } catch (e) {
     res.status(400).json({ error: e.message });
   }
 });
 
-// Get PO + steps + files per step
-app.get("/api/po/:id", (req, res) => {
+// Edit PO folder name
+app.patch("/api/po/:id", requireAuth, (req, res) => {
+  const id = Number(req.params.id);
+  const po = db.prepare(`SELECT * FROM po_folders WHERE id = ?`).get(id);
+  if (!po) return res.status(404).json({ error: "PO not found" });
+
+  const { folder_name } = req.body || {};
+  if (!folder_name || !String(folder_name).trim()) return res.status(400).json({ error: "folder_name required" });
+
+  const parsed = parsePOFolderName(String(folder_name).trim());
+  const u = req.session.user.username;
+
+  db.prepare(`
+    UPDATE po_folders
+    SET folder_name = ?,
+        capex_opex = ?,
+        it_ref_no = ?,
+        title = ?,
+        updated_at = ?,
+        updated_by = ?
+    WHERE id = ?
+  `).run(
+    String(folder_name).trim(),
+    parsed.capex_opex,
+    parsed.it_ref_no,
+    parsed.title,
+    nowISO(),
+    u,
+    id
+  );
+
+  res.json({ ok: true });
+});
+
+// Delete PO
+app.delete("/api/po/:id", requireAuth, (req, res) => {
+  const id = Number(req.params.id);
+  db.prepare(`DELETE FROM po_folders WHERE id = ?`).run(id);
+  res.json({ ok: true });
+});
+
+// ✅ Get PO + steps + files
+app.get("/api/po/:id", requireAuth, (req, res) => {
   const id = Number(req.params.id);
   const po = db.prepare(`SELECT * FROM po_folders WHERE id = ?`).get(id);
   if (!po) return res.status(404).json({ error: "Not found" });
 
-  const steps = db.prepare(`
-    SELECT * FROM po_steps
-    WHERE po_id = ?
-    ORDER BY step_no ASC
-  `).all(id);
+  const steps = db.prepare(`SELECT * FROM po_steps WHERE po_id = ? ORDER BY step_no ASC`).all(id);
+  const stepIds = steps.map(s => s.id);
 
-  // attach files array to each step
+  let files = [];
+  if (stepIds.length) {
+    const qs = stepIds.map(() => "?").join(",");
+    files = db.prepare(`SELECT * FROM po_step_files WHERE step_id IN (${qs}) ORDER BY uploaded_at DESC`).all(...stepIds);
+  }
+
   const filesByStep = new Map();
-  const files = db.prepare(`
-    SELECT * FROM po_step_files
-    WHERE step_id IN (SELECT id FROM po_steps WHERE po_id = ?)
-    ORDER BY uploaded_at DESC
-  `).all(id);
-
   for (const f of files) {
     if (!filesByStep.has(f.step_id)) filesByStep.set(f.step_id, []);
     filesByStep.get(f.step_id).push(f);
@@ -217,68 +483,55 @@ app.get("/api/po/:id", (req, res) => {
   res.json({ po, steps: stepsWithFiles });
 });
 
-// Update checkbox action only
-app.patch("/api/step/:id", (req, res) => {
+// Update step checkboxes
+app.patch("/api/step/:id", requireAuth, (req, res) => {
   const id = Number(req.params.id);
   const step = db.prepare(`SELECT * FROM po_steps WHERE id = ?`).get(id);
   if (!step) return res.status(404).json({ error: "Not found" });
 
-  const { action_done } = req.body;
+  const body = req.body || {};
+  const next = { ...step };
+  const user = req.session.user.username;
 
-  const newAction =
-    typeof action_done === "boolean" ? (action_done ? 1 : 0) : step.action_done;
+  // allow these booleans
+  for (const k of ["masterlist_done", "sharepoint_done", "notion_done", "outlook_done", "paid_done"]) {
+    if (typeof body[k] === "boolean") next[k] = body[k] ? 1 : 0;
+  }
 
-  const hasFiles = stepHasAnyFiles(id);
-  const newIsDone = computeStepDone(step.step_no, hasFiles, newAction) ? 1 : 0;
+  // compute done with files
+  const fileCount = getStepFileCount(id);
+  const newIsDone = computeStepDone(step.step_no, next, fileCount) ? 1 : 0;
 
   db.prepare(`
     UPDATE po_steps
-    SET action_done = ?,
+    SET masterlist_done = ?,
+        sharepoint_done = ?,
+        notion_done = ?,
+        outlook_done = ?,
+        paid_done = ?,
         is_done = ?,
-        updated_at = ?
+        updated_at = ?,
+        updated_by = ?
     WHERE id = ?
-  `).run(newAction, newIsDone, nowISO(), id);
+  `).run(
+    next.masterlist_done,
+    next.sharepoint_done,
+    next.notion_done,
+    next.outlook_done,
+    next.paid_done,
+    newIsDone,
+    nowISO(),
+    user,
+    id
+  );
 
-  db.prepare(`UPDATE po_folders SET updated_at = ? WHERE id = ?`).run(nowISO(), step.po_id);
+  db.prepare(`UPDATE po_folders SET updated_at = ?, updated_by = ? WHERE id = ?`).run(
+    nowISO(),
+    user,
+    step.po_id
+  );
 
   res.json({ ok: true });
-});
-
-// Upload file to a step (adds a NEW file row each time)
-app.post("/api/step/:id/upload", upload.single("file"), (req, res) => {
-  const stepId = Number(req.params.id);
-  const step = db.prepare(`SELECT * FROM po_steps WHERE id = ?`).get(stepId);
-  if (!step) return res.status(404).json({ error: "Not found" });
-  if (!req.file) return res.status(400).json({ error: "No file uploaded" });
-
-  const file_name = req.file.originalname;
-  const file_path = `/uploads/${req.file.filename}`;
-
-  const trx = db.transaction(() => {
-    db.prepare(`
-      INSERT INTO po_step_files (step_id, file_name, file_path, uploaded_at)
-      VALUES (?, ?, ?, ?)
-    `).run(stepId, file_name, file_path, nowISO());
-
-    const hasFiles = true; // after insert, definitely has at least 1
-    const newIsDone = computeStepDone(step.step_no, hasFiles, step.action_done) ? 1 : 0;
-
-    db.prepare(`
-      UPDATE po_steps
-      SET is_done = ?, updated_at = ?
-      WHERE id = ?
-    `).run(newIsDone, nowISO(), stepId);
-
-    db.prepare(`UPDATE po_folders SET updated_at = ? WHERE id = ?`).run(nowISO(), step.po_id);
-
-    return { ok: true, file_name, file_path };
-  });
-
-  try {
-    res.json(trx());
-  } catch (e) {
-    res.status(400).json({ error: e.message });
-  }
 });
 
 const PORT = process.env.PORT || 3000;
