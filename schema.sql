@@ -1,7 +1,9 @@
+PRAGMA foreign_keys = ON;
+
 CREATE TABLE IF NOT EXISTS months (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   month_key TEXT UNIQUE NOT NULL,         -- e.g. 2026-02
-  label TEXT NOT NULL,                    -- e.g. February 2026
+  label TEXT NOT NULL,                    -- e.g. Jan 2026
   created_at TEXT NOT NULL
 );
 
@@ -26,17 +28,19 @@ CREATE TABLE IF NOT EXISTS po_steps (
   step_no INTEGER NOT NULL,               -- 1..9
   step_title TEXT NOT NULL,
   step_desc TEXT NOT NULL,
+
+  -- stored done state
   is_done INTEGER NOT NULL DEFAULT 0,      -- 0/1
 
-  -- Optional extra links user can fill
-  link1 TEXT,
-  link2 TEXT,
+  -- checkbox action for steps 4/5/6/8/9
+  action_done INTEGER NOT NULL DEFAULT 0,
 
   -- Optional upload
   file_name TEXT,
   file_path TEXT,
   uploaded_at TEXT,
 
+  created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
 
   FOREIGN KEY (po_id) REFERENCES po_folders(id) ON DELETE CASCADE

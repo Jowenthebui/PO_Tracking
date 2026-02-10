@@ -17,43 +17,169 @@ function matchesSearch(text, q) {
 }
 
 /* ============================
-   QUICK LINKS (HINTS)
-   Edit these once with real URLs
+   QUICK LINKS (EDIT THESE)
 ============================ */
 const QUICK_LINKS = {
   NOTION: "https://your-notion-link-here",
   MASTERLIST: "https://your-masterlist-link-here",
-  SHAREPOINT: "https://your-sharepoint-link-here"
+  SHAREPOINT: "https://your-sharepoint-link-here",
+  CAPEX_OPEX_TEMPLATE: "https://your-capex-opex-template-link-here"
 };
 
 // Which steps should show hint links
-// You can add more steps here anytime.
 const STEP_HINTS = {
   5: [
     { label: "SharePoint", url: QUICK_LINKS.SHAREPOINT },
-    { label: "Masterlist", url: QUICK_LINKS.MASTERLIST },
-    { label: "Notion", url: QUICK_LINKS.NOTION }
+    { label: "Masterlist", url: QUICK_LINKS.MASTERLIST }
   ],
   8: [
     { label: "SharePoint", url: QUICK_LINKS.SHAREPOINT },
-    { label: "Masterlist", url: QUICK_LINKS.MASTERLIST },
-    { label: "Notion", url: QUICK_LINKS.NOTION }
+    { label: "Masterlist", url: QUICK_LINKS.MASTERLIST }
   ]
 };
 
 function renderHintLinks(stepNo) {
   const hints = STEP_HINTS[stepNo] || [];
-
-  // hide if not configured (still placeholder)
   const usable = hints.filter(h => h.url && !h.url.includes("your-"));
   if (!usable.length) return "";
-
   return `
     <div class="links">
       <span class="pill">Quick links</span>
       ${usable.map(h => `<a class="pill" href="${h.url}" target="_blank" rel="noreferrer">${h.label}</a>`).join("")}
     </div>
   `;
+}
+
+function monthKeyFromLabel(label) {
+  // Accepts "Jan 2026" / "January 2026" etc.
+  const d = new Date(`1 ${label}`);
+  if (Number.isNaN(d.getTime())) return null;
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  return `${y}-${m}`;
+}
+
+function daysBetween(aISO, bISO) {
+  const a = new Date(aISO).getTime();
+  const b = new Date(bISO).getTime();
+  if (Number.isNaN(a) || Number.isNaN(b)) return 0;
+  return Math.floor((b - a) / (1000 * 60 * 60 * 24));
+}
+
+function needsCheckbox(stepNo) {
+  // 4,5,6,8,9 require checkbox action
+  return [4, 5, 6, 8, 9].includes(stepNo);
+}
+
+function needsUpload(stepNo) {
+  // All steps can upload EXCEPT 5 and 8 which are checkbox-only
+  return ![5, 8].includes(stepNo);
+}
+
+function extraInfoHTML(stepNo) {
+  if (stepNo === 2) {
+    const ok = QUICK_LINKS.CAPEX_OPEX_TEMPLATE && !QUICK_LINKS.CAPEX_OPEX_TEMPLATE.includes("your-");
+    return ok
+      ? `<div class="links"><a class="pill" href="${QUICK_LINKS.CAPEX_OPEX_TEMPLATE}" target="_blank" rel="noreferrer">Capex/Opex Template</a></div>`
+      : "";
+  }
+  return "";
+}
+
+function renderStepsHTML(steps) {
+  const now = new Date().toISOString();
+
+  return `
+    <div class="steps">
+      ${steps
+        .map(s => {
+          const isOverdue =
+            s.step_no === 9 && !s.is_done && s.created_at && daysBetween(s.created_at, now) >= 14;
+
+          return `
+          <div class="step ${s.is_done ? "done" : ""} ${isOverdue ? "overdue" : ""}" data-step-id="${s.id}">
+            <div class="step-head">
+              <div style="flex:1;">
+                <div class="step-title">
+                  <b>${s.step_no}. ${s.step_title}</b>
+                  ${s.is_done ? `<span class="pill donepill">Done</span>` : ``}
+                  ${
+                    isOverdue
+                      ? `<span class="pill overduepill">Overdue > 2 weeks</span>`
+                      : ``
+                  }
+                </div>
+
+                <div class="muted">${s.step_desc}</div>
+
+                ${extraInfoHTML(s.step_no)}
+                ${renderHintLinks(s.step_no)}
+              </div>
+
+              ${
+                needsCheckbox(s.step_no)
+                  ? `<label class="pill">
+                      <input type="checkbox" data-action ${s.action_done ? "checked" : ""} />
+                      Done
+                    </label>`
+                  : ``
+              }
+            </div>
+
+            ${
+              needsUpload(s.step_no)
+                ? `
+                  <div class="fileline">
+                    <input type="file" data-file />
+                    <button data-upload>Upload</button>
+                    ${
+                      s.file_path
+                        ? `<a href="${s.file_path}" target="_blank" rel="noreferrer">Open file</a>`
+                        : `<span class="muted">No file</span>`
+                    }
+                  </div>
+                `
+                : ``
+            }
+          </div>
+        `;
+        })
+        .join("")}
+    </div>
+  `;
+}
+
+function wireSteps(container, steps) {
+  for (const s of steps) {
+    const card = container.querySelector(`[data-step-id="${s.id}"]`);
+    const action = card.querySelector("[data-action]");
+    const fileInput = card.querySelector("[data-file]");
+    const uploadBtn = card.querySelector("[data-upload]");
+
+    if (action) {
+      action.onchange = async () => {
+        await api(`/api/step/${s.id}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action_done: !!action.checked })
+        });
+        await loadTree();
+      };
+    }
+
+    if (uploadBtn) {
+      uploadBtn.onclick = async () => {
+        const f = fileInput.files?.[0];
+        if (!f) return alert("Choose a file first");
+
+        const form = new FormData();
+        form.append("file", f);
+
+        await api(`/api/step/${s.id}/upload`, { method: "POST", body: form });
+        await loadTree();
+      };
+    }
+  }
 }
 
 async function loadTree() {
@@ -97,11 +223,13 @@ async function loadTree() {
 
     for (const p of filteredPOs) {
       const poDetails = document.createElement("details");
-      poDetails.className = "po";
+      poDetails.className = `po ${p.is_all_done ? "all-done" : ""}`;
+
       poDetails.innerHTML = `
         <summary>
           <span>${p.folder_name}</span>
           <span class="pill">${p.capex_opex}</span>
+          <span class="pill">${p.done_steps}/${p.total_steps} done</span>
           <span class="pill">${new Date(p.updated_at).toLocaleString()}</span>
         </summary>
       `;
@@ -124,25 +252,15 @@ async function loadTree() {
     monthBox.appendChild(poList);
     monthDetails.appendChild(monthBox);
 
-    // Add PO handler
+    // Add PO handler (ONLY one prompt)
     addRow.querySelector("[data-addpo]").onclick = async () => {
-      const folder_name = prompt("PO Folder Name\nExample: 2026-02-IT-001_Capex_Hello World");
+      const folder_name = prompt("PO Folder Name\nExample: 2025-01-IT-001_Capex_Name");
       if (!folder_name) return;
-
-      const cap = prompt("CAPEX or OPEX? (type CAPEX / OPEX)", "CAPEX");
-      const capex_opex = (cap || "").toUpperCase();
-      if (!["CAPEX","OPEX"].includes(capex_opex)) return alert("Must be CAPEX or OPEX");
-
-      const it_ref_no = prompt("IT Ref No (example: IT-001)");
-      if (!it_ref_no) return;
-
-      const title = prompt("Title (example: Hello World)");
-      if (!title) return;
 
       await api("/api/po", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ month_id: m.id, folder_name, capex_opex, it_ref_no, title })
+        body: JSON.stringify({ month_id: m.id, folder_name: folder_name.trim() })
       });
 
       await loadTree();
@@ -157,94 +275,18 @@ async function loadTree() {
   }
 }
 
-function renderStepsHTML(steps) {
-  return `
-    <div class="steps">
-      ${steps.map(s => `
-        <div class="step ${s.is_done ? "done" : ""}" data-step-id="${s.id}">
-          <div class="step-head">
-            <div style="flex:1;">
-              <div class="step-title">
-                ${s.step_no}. ${s.step_title}
-                ${s.is_done ? `<span class="pill donepill">Done</span>` : ``}
-              </div>
-              <div class="muted">${s.step_desc}</div>
-              ${renderHintLinks(s.step_no)}
-            </div>
-
-            <label class="pill">
-              <input type="checkbox" data-done ${s.is_done ? "checked" : ""} />
-              Done
-            </label>
-          </div>
-
-          <div class="links">
-            <input data-link1 placeholder="Extra Link 1 (optional)" value="${s.link1 || ""}" />
-            <input data-link2 placeholder="Extra Link 2 (optional)" value="${s.link2 || ""}" />
-            <button data-save>Save</button>
-          </div>
-
-          <div class="fileline">
-            <input type="file" data-file />
-            <button data-upload>Upload</button>
-            ${
-              s.file_path
-                ? `<a href="${s.file_path}" target="_blank" rel="noreferrer">Open file</a>`
-                : `<span class="muted">No file</span>`
-            }
-          </div>
-        </div>
-      `).join("")}
-    </div>
-  `;
-}
-
-function wireSteps(container, steps) {
-  for (const s of steps) {
-    const card = container.querySelector(`[data-step-id="${s.id}"]`);
-    const done = card.querySelector("[data-done]");
-    const link1 = card.querySelector("[data-link1]");
-    const link2 = card.querySelector("[data-link2]");
-    const saveBtn = card.querySelector("[data-save]");
-    const fileInput = card.querySelector("[data-file]");
-    const uploadBtn = card.querySelector("[data-upload]");
-
-    saveBtn.onclick = async () => {
-      await api(`/api/step/${s.id}`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          is_done: !!done.checked,
-          link1: link1.value || null,
-          link2: link2.value || null
-        })
-      });
-      await loadTree();
-    };
-
-    uploadBtn.onclick = async () => {
-      const f = fileInput.files?.[0];
-      if (!f) return alert("Choose a file first");
-
-      const form = new FormData();
-      form.append("file", f);
-
-      await api(`/api/step/${s.id}/upload`, { method: "POST", body: form });
-      await loadTree();
-    };
-  }
-}
-
+// New Month button (ONLY one prompt)
 document.querySelector("#newMonthBtn").onclick = async () => {
-  const month_key = prompt("Month key (YYYY-MM)\nExample: 2026-02");
-  if (!month_key) return;
+  const label = prompt("Month folder name\nExample: Jan 2026");
+  if (!label) return;
 
-  const label = prompt("Label\nExample: February 2026", month_key) || month_key;
+  const month_key = monthKeyFromLabel(label.trim());
+  if (!month_key) return alert("Invalid month format. Try: Jan 2026");
 
   await api("/api/months", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ month_key, label })
+    body: JSON.stringify({ month_key, label: label.trim() })
   });
 
   await loadTree();

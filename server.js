@@ -29,22 +29,65 @@ const storage = multer.diskStorage({
 });
 const upload = multer({ storage });
 
-// Default steps 1–9 (your workflow)
+// Steps 1–9 (your workflow text)
 const DEFAULT_STEPS = [
-  { no: 1, title: "Quotations", desc: "Collect vendor quotations. Upload files or paste link(s)." },
-  { no: 2, title: "Upload Capex/Opex Forms in Excel", desc: "Create CAPEX/OPEX form (manual name) and upload the Excel or link it." },
-  { no: 3, title: "Combined Capex/Opex with quotations (pdf)", desc: "Combine CAPEX/OPEX + quotations into one PDF. Upload or link." },
-  { no: 4, title: "Signed Combined PDF", desc: "Get the combined PDF signed. Upload or paste the signed file link." },
-  { no: 5, title: "Upload to admin (sharepoint and masterlist)", desc: "Upload signed PDF to SharePoint + update masterlist / Notion status." },
-  { no: 6, title: "PO", desc: "Get PO from admin and send back to manager. Upload PO file or link." },
-  { no: 7, title: "Invoice", desc: "Get invoice from vendor. Upload invoice or link." },
-  { no: 8, title: "Upload to admin (sharepoint and masterlist)", desc: "Upload invoice to SharePoint + update masterlist / Notion status." },
-  { no: 9, title: "Make payment", desc: "Admin makes payment. Follow up if needed, upload payment slip or link." }
+  { no: 1, title: "Quotations", desc: "Please upload quotations." },
+  { no: 2, title: "Create Capex/Opex Form in Excel", desc: "Fill in the CAPEX/OPEX form and upload the file." },
+  { no: 3, title: "Combine Capex/Opex Form with Quotations", desc: "Combine CAPEX/OPEX form with the quotations. If multiple vendor, put the chosen one first." },
+  { no: 4, title: "Signed Combined File", desc: "Please upload the signed CAPEX/OPEX form here and tick the checkbox after signed." },
+  { no: 5, title: "Update Signed Capex/Opex Form to Admin", desc: "Update to SharePoint and upload to Masterlist. Tick checkbox after done." },
+  { no: 6, title: "PO", desc: "Get PO from Admin, send it back to manager on Outlook. Upload PO here and tick checkbox after sending." },
+  { no: 7, title: "Invoice", desc: "Get invoice from vendor and upload here." },
+  { no: 8, title: "Update Invoice to Admin", desc: "Upload invoice on Masterlist and SharePoint folder. Tick checkbox after done." },
+  { no: 9, title: "Admin Make Payment", desc: "Tick checkbox when payment is made. Optional: upload proof of payment." }
 ];
+
+// Completion rules
+function computeStepDone(step_no, file_path, action_done) {
+  const hasFile = !!file_path;
+
+  // Auto-done when file uploaded
+  if ([1, 2, 3, 7].includes(step_no)) return hasFile;
+
+  // Need file + checkbox
+  if ([4, 6].includes(step_no)) return hasFile && !!action_done;
+
+  // Checkbox only (file optional for 9)
+  if ([5, 8, 9].includes(step_no)) return !!action_done;
+
+  return false;
+}
+
+function parsePOFolderName(folder_name) {
+  // Expected: 2025-01-IT-001_Capex_Name Here
+  const raw = String(folder_name || "").trim();
+  const parts = raw.split("_").map(s => s.trim()).filter(Boolean);
+
+  let capex_opex = "CAPEX";
+  for (const p of parts) {
+    const low = p.toLowerCase();
+    if (low === "capex") capex_opex = "CAPEX";
+    if (low === "opex") capex_opex = "OPEX";
+  }
+
+  const itMatch = raw.match(/\bIT-\d+\b/i);
+  const it_ref_no = itMatch ? itMatch[0].toUpperCase() : "IT-UNKNOWN";
+
+  // title = everything after capex/opex underscore, else fallback
+  let title = "Untitled";
+  const capIndex = parts.findIndex(p => ["capex", "opex"].includes(p.toLowerCase()));
+  if (capIndex >= 0 && parts[capIndex + 1]) {
+    title = parts.slice(capIndex + 1).join(" ");
+  } else if (parts.length) {
+    title = parts.slice(1).join(" ") || raw;
+  }
+
+  return { capex_opex, it_ref_no, title };
+}
 
 // ---- API ----
 
-// Create month folder
+// Create month folder (month_key is computed in frontend, label is user input)
 app.post("/api/months", (req, res) => {
   const { month_key, label } = req.body;
 
@@ -64,11 +107,22 @@ app.post("/api/months", (req, res) => {
   }
 });
 
-// List tree (months -> PO folders)
+// List tree (months -> PO folders) + include done summary + all-done flag
 app.get("/api/tree", (_req, res) => {
   const months = db.prepare(`SELECT * FROM months ORDER BY month_key DESC`).all();
+
   const pos = db.prepare(`
-    SELECT p.*, m.month_key
+    SELECT
+      p.*,
+      m.month_key,
+      (
+        SELECT COUNT(*) FROM po_steps s
+        WHERE s.po_id = p.id
+      ) AS total_steps,
+      (
+        SELECT COUNT(*) FROM po_steps s
+        WHERE s.po_id = p.id AND s.is_done = 1
+      ) AS done_steps
     FROM po_folders p
     JOIN months m ON m.id = p.month_id
     ORDER BY m.month_key DESC, p.created_at DESC
@@ -76,24 +130,36 @@ app.get("/api/tree", (_req, res) => {
 
   const map = new Map();
   for (const m of months) map.set(m.id, { ...m, pos: [] });
+
   for (const p of pos) {
     const bucket = map.get(p.month_id);
-    if (bucket) bucket.pos.push(p);
+    if (!bucket) continue;
+
+    const total = Number(p.total_steps || 0);
+    const done = Number(p.done_steps || 0);
+    const is_all_done = total > 0 && done === total;
+
+    bucket.pos.push({
+      ...p,
+      total_steps: total,
+      done_steps: done,
+      is_all_done
+    });
   }
 
   res.json([...map.values()]);
 });
 
 // Create PO folder under a month + auto-create steps
+// ONLY requires month_id + folder_name (others are parsed)
 app.post("/api/po", (req, res) => {
-  const { month_id, folder_name, capex_opex, it_ref_no, title } = req.body;
+  const { month_id, folder_name } = req.body;
 
-  if (!month_id || !folder_name || !capex_opex || !it_ref_no || !title) {
-    return res.status(400).json({ error: "month_id, folder_name, capex_opex, it_ref_no, title required" });
+  if (!month_id || !folder_name) {
+    return res.status(400).json({ error: "month_id and folder_name required" });
   }
-  if (!["CAPEX", "OPEX"].includes(capex_opex)) {
-    return res.status(400).json({ error: "capex_opex must be CAPEX or OPEX" });
-  }
+
+  const { capex_opex, it_ref_no, title } = parsePOFolderName(folder_name);
 
   const created_at = nowISO();
   const updated_at = created_at;
@@ -107,12 +173,13 @@ app.post("/api/po", (req, res) => {
     const poId = info.lastInsertRowid;
 
     const ins = db.prepare(`
-      INSERT INTO po_steps (po_id, step_no, step_title, step_desc, is_done, updated_at)
-      VALUES (?, ?, ?, ?, 0, ?)
+      INSERT INTO po_steps (po_id, step_no, step_title, step_desc, is_done, action_done, created_at, updated_at)
+      VALUES (?, ?, ?, ?, 0, 0, ?, ?)
     `);
 
     for (const s of DEFAULT_STEPS) {
-      ins.run(poId, s.no, s.title, s.desc, nowISO());
+      const t = nowISO();
+      ins.run(poId, s.no, s.title, s.desc, t, t);
     }
 
     return poId;
@@ -141,28 +208,26 @@ app.get("/api/po/:id", (req, res) => {
   res.json({ po, steps });
 });
 
-// Update step (done + optional links)
+// Update step checkbox action only (no link boxes)
 app.patch("/api/step/:id", (req, res) => {
   const id = Number(req.params.id);
   const step = db.prepare(`SELECT * FROM po_steps WHERE id = ?`).get(id);
   if (!step) return res.status(404).json({ error: "Not found" });
 
-  const { is_done, link1, link2 } = req.body;
+  const { action_done } = req.body;
+
+  const newAction =
+    typeof action_done === "boolean" ? (action_done ? 1 : 0) : step.action_done;
+
+  const newIsDone = computeStepDone(step.step_no, step.file_path, newAction) ? 1 : 0;
 
   db.prepare(`
     UPDATE po_steps
-    SET is_done = COALESCE(?, is_done),
-        link1 = COALESCE(?, link1),
-        link2 = COALESCE(?, link2),
+    SET action_done = ?,
+        is_done = ?,
         updated_at = ?
     WHERE id = ?
-  `).run(
-    typeof is_done === "boolean" ? (is_done ? 1 : 0) : null,
-    (link1 === undefined ? null : link1),
-    (link2 === undefined ? null : link2),
-    nowISO(),
-    id
-  );
+  `).run(newAction, newIsDone, nowISO(), id);
 
   db.prepare(`UPDATE po_folders SET updated_at = ? WHERE id = ?`).run(nowISO(), step.po_id);
 
@@ -179,11 +244,13 @@ app.post("/api/step/:id/upload", upload.single("file"), (req, res) => {
   const file_name = req.file.originalname;
   const file_path = `/uploads/${req.file.filename}`;
 
+  const newIsDone = computeStepDone(step.step_no, file_path, step.action_done) ? 1 : 0;
+
   db.prepare(`
     UPDATE po_steps
-    SET file_name = ?, file_path = ?, uploaded_at = ?, updated_at = ?
+    SET file_name = ?, file_path = ?, uploaded_at = ?, is_done = ?, updated_at = ?
     WHERE id = ?
-  `).run(file_name, file_path, nowISO(), nowISO(), id);
+  `).run(file_name, file_path, nowISO(), newIsDone, nowISO(), id);
 
   db.prepare(`UPDATE po_folders SET updated_at = ? WHERE id = ?`).run(nowISO(), step.po_id);
 
