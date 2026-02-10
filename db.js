@@ -6,6 +6,9 @@ const DB_FILE = path.join(__dirname, "po_tracker.db");
 const SCHEMA_FILE = path.join(__dirname, "schema.sql");
 
 const db = new Database(DB_FILE);
+
+db.pragma("foreign_keys = ON");
+
 db.exec(fs.readFileSync(SCHEMA_FILE, "utf-8"));
 
 module.exports = db;

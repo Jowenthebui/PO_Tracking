@@ -1,5 +1,3 @@
-PRAGMA foreign_keys = ON;
-
 CREATE TABLE IF NOT EXISTS months (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   month_key TEXT UNIQUE NOT NULL,         -- e.g. 2026-02
