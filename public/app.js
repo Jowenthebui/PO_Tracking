@@ -26,7 +26,6 @@ const QUICK_LINKS = {
   CAPEX_OPEX_TEMPLATE: "https://your-capex-opex-template-link-here"
 };
 
-// Which steps should show hint links
 const STEP_HINTS = {
   5: [
     { label: "SharePoint", url: QUICK_LINKS.SHAREPOINT },
@@ -51,7 +50,6 @@ function renderHintLinks(stepNo) {
 }
 
 function monthKeyFromLabel(label) {
-  // Accepts "Jan 2026" / "January 2026" etc.
   const d = new Date(`1 ${label}`);
   if (Number.isNaN(d.getTime())) return null;
   const y = d.getFullYear();
@@ -67,12 +65,10 @@ function daysBetween(aISO, bISO) {
 }
 
 function needsCheckbox(stepNo) {
-  // 4,5,6,8,9 require checkbox action
   return [4, 5, 6, 8, 9].includes(stepNo);
 }
 
 function needsUpload(stepNo) {
-  // All steps can upload EXCEPT 5 and 8 which are checkbox-only
   return ![5, 8].includes(stepNo);
 }
 
@@ -86,28 +82,40 @@ function extraInfoHTML(stepNo) {
   return "";
 }
 
+function renderFilesHTML(files) {
+  if (!files || files.length === 0) {
+    return `<div class="muted">No files uploaded</div>`;
+  }
+
+  return `
+    <div class="filelist">
+      ${files.map(f => `
+        <div class="fileitem">
+          <a href="${f.file_path}" target="_blank" rel="noreferrer">${f.file_name}</a>
+          <span class="pill">${new Date(f.uploaded_at).toLocaleString()}</span>
+        </div>
+      `).join("")}
+    </div>
+  `;
+}
+
 function renderStepsHTML(steps) {
   const now = new Date().toISOString();
 
   return `
     <div class="steps">
-      ${steps
-        .map(s => {
-          const isOverdue =
-            s.step_no === 9 && !s.is_done && s.created_at && daysBetween(s.created_at, now) >= 14;
+      ${steps.map(s => {
+        const isOverdue =
+          s.step_no === 9 && !s.is_done && s.created_at && daysBetween(s.created_at, now) >= 14;
 
-          return `
+        return `
           <div class="step ${s.is_done ? "done" : ""} ${isOverdue ? "overdue" : ""}" data-step-id="${s.id}">
             <div class="step-head">
               <div style="flex:1;">
                 <div class="step-title">
                   <b>${s.step_no}. ${s.step_title}</b>
                   ${s.is_done ? `<span class="pill donepill">Done</span>` : ``}
-                  ${
-                    isOverdue
-                      ? `<span class="pill overduepill">Overdue > 2 weeks</span>`
-                      : ``
-                  }
+                  ${isOverdue ? `<span class="pill overduepill">Overdue > 2 weeks</span>` : ``}
                 </div>
 
                 <div class="muted">${s.step_desc}</div>
@@ -132,19 +140,16 @@ function renderStepsHTML(steps) {
                   <div class="fileline">
                     <input type="file" data-file />
                     <button data-upload>Upload</button>
-                    ${
-                      s.file_path
-                        ? `<a href="${s.file_path}" target="_blank" rel="noreferrer">Open file</a>`
-                        : `<span class="muted">No file</span>`
-                    }
                   </div>
+                  ${renderFilesHTML(s.files)}
                 `
-                : ``
+                : `
+                  ${renderFilesHTML(s.files)}
+                `
             }
           </div>
         `;
-        })
-        .join("")}
+      }).join("")}
     </div>
   `;
 }
@@ -252,7 +257,6 @@ async function loadTree() {
     monthBox.appendChild(poList);
     monthDetails.appendChild(monthBox);
 
-    // Add PO handler (ONLY one prompt)
     addRow.querySelector("[data-addpo]").onclick = async () => {
       const folder_name = prompt("PO Folder Name\nExample: 2025-01-IT-001_Capex_Name");
       if (!folder_name) return;
@@ -275,7 +279,7 @@ async function loadTree() {
   }
 }
 
-// New Month button (ONLY one prompt)
+// New Month (one prompt)
 document.querySelector("#newMonthBtn").onclick = async () => {
   const label = prompt("Month folder name\nExample: Jan 2026");
   if (!label) return;

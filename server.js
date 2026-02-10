@@ -29,7 +29,7 @@ const storage = multer.diskStorage({
 });
 const upload = multer({ storage });
 
-// Steps 1–9 (your workflow text)
+// Steps 1–9
 const DEFAULT_STEPS = [
   { no: 1, title: "Quotations", desc: "Please upload quotations." },
   { no: 2, title: "Create Capex/Opex Form in Excel", desc: "Fill in the CAPEX/OPEX form and upload the file." },
@@ -42,24 +42,7 @@ const DEFAULT_STEPS = [
   { no: 9, title: "Admin Make Payment", desc: "Tick checkbox when payment is made. Optional: upload proof of payment." }
 ];
 
-// Completion rules
-function computeStepDone(step_no, file_path, action_done) {
-  const hasFile = !!file_path;
-
-  // Auto-done when file uploaded
-  if ([1, 2, 3, 7].includes(step_no)) return hasFile;
-
-  // Need file + checkbox
-  if ([4, 6].includes(step_no)) return hasFile && !!action_done;
-
-  // Checkbox only (file optional for 9)
-  if ([5, 8, 9].includes(step_no)) return !!action_done;
-
-  return false;
-}
-
 function parsePOFolderName(folder_name) {
-  // Expected: 2025-01-IT-001_Capex_Name Here
   const raw = String(folder_name || "").trim();
   const parts = raw.split("_").map(s => s.trim()).filter(Boolean);
 
@@ -73,7 +56,6 @@ function parsePOFolderName(folder_name) {
   const itMatch = raw.match(/\bIT-\d+\b/i);
   const it_ref_no = itMatch ? itMatch[0].toUpperCase() : "IT-UNKNOWN";
 
-  // title = everything after capex/opex underscore, else fallback
   let title = "Untitled";
   const capIndex = parts.findIndex(p => ["capex", "opex"].includes(p.toLowerCase()));
   if (capIndex >= 0 && parts[capIndex + 1]) {
@@ -85,9 +67,30 @@ function parsePOFolderName(folder_name) {
   return { capex_opex, it_ref_no, title };
 }
 
+function stepHasAnyFiles(stepId) {
+  const row = db
+    .prepare(`SELECT 1 AS ok FROM po_step_files WHERE step_id = ? LIMIT 1`)
+    .get(stepId);
+  return !!row;
+}
+
+// Completion rules (now based on: any files exist)
+function computeStepDone(step_no, hasFiles, action_done) {
+  // Auto done when file exists
+  if ([1, 2, 3, 7].includes(step_no)) return hasFiles;
+
+  // Need file + checkbox
+  if ([4, 6].includes(step_no)) return hasFiles && !!action_done;
+
+  // Checkbox only (file optional for 9)
+  if ([5, 8, 9].includes(step_no)) return !!action_done;
+
+  return false;
+}
+
 // ---- API ----
 
-// Create month folder (month_key is computed in frontend, label is user input)
+// Create month folder
 app.post("/api/months", (req, res) => {
   const { month_key, label } = req.body;
 
@@ -107,7 +110,7 @@ app.post("/api/months", (req, res) => {
   }
 });
 
-// List tree (months -> PO folders) + include done summary + all-done flag
+// Tree with done summary
 app.get("/api/tree", (_req, res) => {
   const months = db.prepare(`SELECT * FROM months ORDER BY month_key DESC`).all();
 
@@ -115,14 +118,8 @@ app.get("/api/tree", (_req, res) => {
     SELECT
       p.*,
       m.month_key,
-      (
-        SELECT COUNT(*) FROM po_steps s
-        WHERE s.po_id = p.id
-      ) AS total_steps,
-      (
-        SELECT COUNT(*) FROM po_steps s
-        WHERE s.po_id = p.id AND s.is_done = 1
-      ) AS done_steps
+      (SELECT COUNT(*) FROM po_steps s WHERE s.po_id = p.id) AS total_steps,
+      (SELECT COUNT(*) FROM po_steps s WHERE s.po_id = p.id AND s.is_done = 1) AS done_steps
     FROM po_folders p
     JOIN months m ON m.id = p.month_id
     ORDER BY m.month_key DESC, p.created_at DESC
@@ -139,19 +136,13 @@ app.get("/api/tree", (_req, res) => {
     const done = Number(p.done_steps || 0);
     const is_all_done = total > 0 && done === total;
 
-    bucket.pos.push({
-      ...p,
-      total_steps: total,
-      done_steps: done,
-      is_all_done
-    });
+    bucket.pos.push({ ...p, total_steps: total, done_steps: done, is_all_done });
   }
 
   res.json([...map.values()]);
 });
 
-// Create PO folder under a month + auto-create steps
-// ONLY requires month_id + folder_name (others are parsed)
+// Create PO (only month_id + folder_name)
 app.post("/api/po", (req, res) => {
   const { month_id, folder_name } = req.body;
 
@@ -193,7 +184,7 @@ app.post("/api/po", (req, res) => {
   }
 });
 
-// Get PO folder + steps
+// Get PO + steps + files per step
 app.get("/api/po/:id", (req, res) => {
   const id = Number(req.params.id);
   const po = db.prepare(`SELECT * FROM po_folders WHERE id = ?`).get(id);
@@ -205,10 +196,28 @@ app.get("/api/po/:id", (req, res) => {
     ORDER BY step_no ASC
   `).all(id);
 
-  res.json({ po, steps });
+  // attach files array to each step
+  const filesByStep = new Map();
+  const files = db.prepare(`
+    SELECT * FROM po_step_files
+    WHERE step_id IN (SELECT id FROM po_steps WHERE po_id = ?)
+    ORDER BY uploaded_at DESC
+  `).all(id);
+
+  for (const f of files) {
+    if (!filesByStep.has(f.step_id)) filesByStep.set(f.step_id, []);
+    filesByStep.get(f.step_id).push(f);
+  }
+
+  const stepsWithFiles = steps.map(s => ({
+    ...s,
+    files: filesByStep.get(s.id) || []
+  }));
+
+  res.json({ po, steps: stepsWithFiles });
 });
 
-// Update step checkbox action only (no link boxes)
+// Update checkbox action only
 app.patch("/api/step/:id", (req, res) => {
   const id = Number(req.params.id);
   const step = db.prepare(`SELECT * FROM po_steps WHERE id = ?`).get(id);
@@ -219,7 +228,8 @@ app.patch("/api/step/:id", (req, res) => {
   const newAction =
     typeof action_done === "boolean" ? (action_done ? 1 : 0) : step.action_done;
 
-  const newIsDone = computeStepDone(step.step_no, step.file_path, newAction) ? 1 : 0;
+  const hasFiles = stepHasAnyFiles(id);
+  const newIsDone = computeStepDone(step.step_no, hasFiles, newAction) ? 1 : 0;
 
   db.prepare(`
     UPDATE po_steps
@@ -234,27 +244,41 @@ app.patch("/api/step/:id", (req, res) => {
   res.json({ ok: true });
 });
 
-// Upload file to a step
+// Upload file to a step (adds a NEW file row each time)
 app.post("/api/step/:id/upload", upload.single("file"), (req, res) => {
-  const id = Number(req.params.id);
-  const step = db.prepare(`SELECT * FROM po_steps WHERE id = ?`).get(id);
+  const stepId = Number(req.params.id);
+  const step = db.prepare(`SELECT * FROM po_steps WHERE id = ?`).get(stepId);
   if (!step) return res.status(404).json({ error: "Not found" });
   if (!req.file) return res.status(400).json({ error: "No file uploaded" });
 
   const file_name = req.file.originalname;
   const file_path = `/uploads/${req.file.filename}`;
 
-  const newIsDone = computeStepDone(step.step_no, file_path, step.action_done) ? 1 : 0;
+  const trx = db.transaction(() => {
+    db.prepare(`
+      INSERT INTO po_step_files (step_id, file_name, file_path, uploaded_at)
+      VALUES (?, ?, ?, ?)
+    `).run(stepId, file_name, file_path, nowISO());
 
-  db.prepare(`
-    UPDATE po_steps
-    SET file_name = ?, file_path = ?, uploaded_at = ?, is_done = ?, updated_at = ?
-    WHERE id = ?
-  `).run(file_name, file_path, nowISO(), newIsDone, nowISO(), id);
+    const hasFiles = true; // after insert, definitely has at least 1
+    const newIsDone = computeStepDone(step.step_no, hasFiles, step.action_done) ? 1 : 0;
 
-  db.prepare(`UPDATE po_folders SET updated_at = ? WHERE id = ?`).run(nowISO(), step.po_id);
+    db.prepare(`
+      UPDATE po_steps
+      SET is_done = ?, updated_at = ?
+      WHERE id = ?
+    `).run(newIsDone, nowISO(), stepId);
 
-  res.json({ ok: true, file_name, file_path });
+    db.prepare(`UPDATE po_folders SET updated_at = ? WHERE id = ?`).run(nowISO(), step.po_id);
+
+    return { ok: true, file_name, file_path };
+  });
+
+  try {
+    res.json(trx());
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
 });
 
 const PORT = process.env.PORT || 3000;

@@ -29,16 +29,8 @@ CREATE TABLE IF NOT EXISTS po_steps (
   step_title TEXT NOT NULL,
   step_desc TEXT NOT NULL,
 
-  -- stored done state
-  is_done INTEGER NOT NULL DEFAULT 0,      -- 0/1
-
-  -- checkbox action for steps 4/5/6/8/9
-  action_done INTEGER NOT NULL DEFAULT 0,
-
-  -- Optional upload
-  file_name TEXT,
-  file_path TEXT,
-  uploaded_at TEXT,
+  is_done INTEGER NOT NULL DEFAULT 0,      -- 0/1 (computed)
+  action_done INTEGER NOT NULL DEFAULT 0,  -- checkbox for steps 4/5/6/8/9
 
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
@@ -48,3 +40,17 @@ CREATE TABLE IF NOT EXISTS po_steps (
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_step_unique
 ON po_steps(po_id, step_no);
+
+-- NEW: Multiple files per step
+CREATE TABLE IF NOT EXISTS po_step_files (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  step_id INTEGER NOT NULL,
+  file_name TEXT NOT NULL,
+  file_path TEXT NOT NULL,
+  uploaded_at TEXT NOT NULL,
+
+  FOREIGN KEY (step_id) REFERENCES po_steps(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_files_step
+ON po_step_files(step_id);
